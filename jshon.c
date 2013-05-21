@@ -3,8 +3,14 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#ifdef _MSC_VER
+#include <getopt.h>
+#include <Windows.h>
+#define uint unsigned int
+#else
 #include <sys/param.h>
 #include <unistd.h>
+#endif
 #include <jansson.h>
 #include <errno.h>
 
@@ -80,18 +86,19 @@ static json_t *compat_json_loads(const char *input, json_error_t *error)
 }
 #endif
 
-#if (defined (__SVR4) && defined (__sun))
+#if (defined (__SVR4) && defined (__sun)) || defined(_MSC_VER)
 #include <stdarg.h>
 
 int asprintf(char **ret, const char *format, ...)
 {
     va_list ap;
+	int count;
     fprintf(stderr, "%s\n", "in the asprintf");
 
     *ret = NULL;  /* Ensure value can be passed to free() */
 
     va_start(ap, format);
-    int count = vsnprintf(NULL, 0, format, ap);
+    count = vsnprintf(NULL, 0, format, ap);
     va_end(ap);
 
     if (count >= 0)
@@ -297,6 +304,37 @@ char* read_stream(FILE* fp)
     return content;
 }
 
+#ifdef _MSC_VER
+ptrdiff_t getline(char **data, size_t *size, FILE *file) {
+    char ch = getc(file);
+    size_t count = 0;
+
+	if (*data == 0 || *size == 0) {
+		*size = 128;
+		*data = malloc(*size);
+	}
+
+
+    while ((ch != '\n') && (ch != EOF)) {
+        if (count+1 == *size) {
+            *size += 128;
+            *data = realloc(*data, *size);
+            if (*data == NULL) {
+                printf("Error reallocating space for line buffer.");
+                exit(1);
+            }
+        }
+        (*data)[count] = ch;
+        count++;
+
+        ch = getc(file);
+    }
+	(*data)[count] = 0;
+
+	return (ch == EOF)?-1:count;
+}
+#endif
+
 char* read_stdin(void)
 {
     if (isatty(fileno(stdin)))
@@ -328,6 +366,7 @@ char* remove_jsonp_callback(char* in, int* rows_skipped, int* cols_skipped)
 // with a reasonable ASCII identifier will work, and that covers 99% of the
 // real world
 {
+	int brackets;
     #define JSON_WHITE(x) ((x) == 0x20 || (x) == 0x9 || (x) == 0xA || (x) == 0xD)
     #define JSON_IDENTIFIER(x) (isalnum(x) || (x) == '$' || (x) == '_' || (x) == '.')
 
@@ -339,7 +378,7 @@ char* remove_jsonp_callback(char* in, int* rows_skipped, int* cols_skipped)
         {--last;}
 
     // count closing brackets at the end, still skipping whitespace
-    int brackets = 0;
+    brackets = 0;
     while (first < last && (JSON_WHITE(*last) || *last == ')'))
     {
         if (*last == ')')
@@ -743,12 +782,14 @@ void debug_map()
 }
 
 int main (int argc, char *argv[])
-#define ALL_OPTIONS "PSQVCItlkupaF:e:s:n:d:i:"
+#define ALL_OPTIONS "LPSQVCItlkupaF:e:s:n:d:i:"
 {
+	int line_mode = 0;
+	size_t content_size = 0;
+	int bytes_read = -1;
     char* content = "";
     char* arg1 = "";
     FILE* fp;
-    json_t* json = NULL;
     json_t* jval = NULL;
     json_error_t error;
     int output = 1;  // flag if json should be printed
@@ -768,6 +809,11 @@ int main (int argc, char *argv[])
     {
         switch (optchar)
         {
+			case 'L':
+				line_mode = 1;
+				content = 0; 
+				content_size = 0;
+				break;
             case 'P':
                 jsonp = 1;
                 break;
@@ -804,156 +850,164 @@ int main (int argc, char *argv[])
                 break;
             default:
                 if (!quiet)
-                    {fprintf(stderr, "Valid: -[P|S|Q|V|C|I] [-F path] -[t|l|k|u|p|a] -[s|n] value -[e|i|d] index\n");}
+                    {fprintf(stderr, "Valid: -[L|P|S|Q|V|C|I] [-F path] -[t|l|k|u|p|a] -[s|n] value -[e|i|d] index\n");}
                 if (crash)
                     {exit(2);}
                 break;
         }
     }
-    optind = 1;
+	do {
+		json_t* json = NULL;
+	    optind = 1;
 #ifdef BSD
-    optreset = 1;
+		optreset = 1;
 #endif
+		if (line_mode) {
+			bytes_read = getline(&content, &content_size, stdin);
+			if (bytes_read == -1) break;
+		} else {
+			if (in_place && strlen(file_path)==0)
+				{err("warning: in-place editing (-I) requires -F");}
 
-    if (in_place && strlen(file_path)==0)
-        {err("warning: in-place editing (-I) requires -F");}
+			if (!strcmp(file_path, "-"))
+				{content = read_stdin();}
+			else if (strlen(file_path) > 0)
+				{content = read_file(file_path);}
+			else
+				{content = read_stdin();}
+			if (!content[0] && !quiet)
+				{fprintf(stderr, "warning: nothing to read\n");}
 
-    if (!strcmp(file_path, "-"))
-        {content = read_stdin();}
-    else if (strlen(file_path) > 0)
-        {content = read_file(file_path);}
-    else
-        {content = read_stdin();}
-    if (!content[0] && !quiet)
-        {fprintf(stderr, "warning: nothing to read\n");}
+			if (jsonp)
+				{content = remove_jsonp_callback(content, &jsonp_rows, &jsonp_cols);}
+		}
+		if (content[0])
+			{json = compat_json_loads(content, &error);}
 
-    if (jsonp)
-        {content = remove_jsonp_callback(content, &jsonp_rows, &jsonp_cols);}
-
-    if (content[0])
-        {json = compat_json_loads(content, &error);}
-
-    if (!json && content[0])
-    {
-        const char *jsonp_status = "";
-        if (jsonp)
-            {jsonp_status = (jsonp_rows||jsonp_cols) ? "(jsonp detected) " : "(jsonp not detected) ";}
+		if (!json && content[0])
+		{
+			const char *jsonp_status = "";
+			if (jsonp)
+				{jsonp_status = (jsonp_rows||jsonp_cols) ? "(jsonp detected) " : "(jsonp not detected) ";}
 
 #if JANSSON_MAJOR_VERSION < 2
-        if (!quiet)
-            {fprintf(stderr, "json %sread error: line %0d: %s\n",
-                 jsonp_status, error.line + jsonp_rows, error.text);}
+			if (!quiet)
+				{fprintf(stderr, "json %sread error: line %0d: %s\n",
+					 jsonp_status, error.line + jsonp_rows, error.text);}
 #else
-        if (!quiet)
-            {fprintf(stderr, "json %sread error: line %0d column %0d: %s\n",
-                jsonp_status, error.line + jsonp_rows, error.column + jsonp_cols, error.text);}
+			if (!quiet)
+				{fprintf(stderr, "json %sread error: line %0d column %0d: %s\n",
+					jsonp_status, error.line + jsonp_rows, error.column + jsonp_cols, error.text);}
 #endif
-        exit(1);
-    }
+			exit(1);
+		}
 
-    if (json)
-        {PUSH(json);}
+		if (json)
+		{
+			PUSH(json);
 
-    do
-    {
-        if (! MAPEMPTY)
-        {
-            while (map_safe_peek()->fin)
-            {
-                MAPPOP();
-                if (MAPEMPTY)
-                    {exit(0);}
-                if (map_safe_peek()->fin)
-                    {MAPNEXT();}
-            }
-            MAPNEXT();
-        }
-        while ((optchar = getopt(argc, argv, ALL_OPTIONS)) != -1)
-        {
-            switch (optchar)
-            {
-                case 't':  // id type
-                    printf("%s\n", pretty_type(PEEK));
-                    output = 0;
-                    break;
-                case 'l':  // length
-                    printf("%i\n", length(PEEK));
-                    output = 0;
-                    break;
-                case 'k':  // keys
-                    keys(PEEK);
-                    output = 0;
-                    break;
-                case 'u':  // unescape string
-                    printf("%s\n", unstring(PEEK));
-                    output = 0;
-                    break;
-                case 'p':  // pop stack
-                    json = POP;
-                    if (by_value)
-                        {json_decref(json);}
-                    output = 1;
-                    break;
-                case 's':  // load string
-                    arg1 = (char*) strdup(optarg);
-                    PUSH(json_string(arg1));
-                    output = 1;
-                    break;
-                case 'n':  // load nonstring
-                    arg1 = (char*) strdup(optarg);
-                    PUSH(nonstring(arg1));
-                    output = 1;
-                    break;
-                case 'e':  // extract
-                    arg1 = (char*) strdup(optarg);
-                    json = PEEK;
-                    PUSH(extract(maybe_deep(json), arg1));
-                    output = 1;
-                    break;
-                case 'd':  // delete
-                    arg1 = (char*) strdup(optarg);
-                    json = POP;
-                    PUSH(delete(json, arg1));
-                    output = 1;
-                    break;
-                case 'i':  // insert
-                    arg1 = (char*) strdup(optarg);
-                    jval = POP;
-                    json = POP;
-                    PUSH(update_native(json, arg1, jval));
-                    output = 1;
-                    break;
-                case 'a':  // across
-                    // something about -a is not mappable?
-                    MAPPUSH();
-                    MAPNEXT();
-                    output = 0;
-                    break;
-                case 'P':  // not manipulations
-                case 'S': 
-                case 'Q':
-                case 'V':
-                case 'C':
-                case 'I':
-                case 'F':
-                    break;
-                default:
-                    if (crash)
-                        {exit(2);}
-                    break;
-            }
-        }
-        if (!in_place && output && stackpointer != stack)
-            {printf("%s\n", smart_dumps(PEEK));}
-    } while (! MAPEMPTY);
+			do
+			{
+				if (! MAPEMPTY)
+				{
+					while (map_safe_peek()->fin)
+					{
+						MAPPOP();
+						if (MAPEMPTY)
+							{exit(0);}
+						if (map_safe_peek()->fin)
+							{MAPNEXT();}
+					}
+					MAPNEXT();
+				}
+				while ((optchar = getopt(argc, argv, ALL_OPTIONS)) != -1)
+				{
+					switch (optchar)
+					{
+						case 't':  // id type
+							printf("%s\n", pretty_type(PEEK));
+							output = 0;
+							break;
+						case 'l':  // length
+							printf("%i\n", length(PEEK));
+							output = 0;
+							break;
+						case 'k':  // keys
+							keys(PEEK);
+							output = 0;
+							break;
+						case 'u':  // unescape string
+							printf("%s\n", unstring(PEEK));
+							output = 0;
+							break;
+						case 'p':  // pop stack
+							json = POP;
+							if (by_value)
+								{json_decref(json);}
+							output = 1;
+							break;
+						case 's':  // load string
+							arg1 = (char*) strdup(optarg);
+							PUSH(json_string(arg1));
+							output = 1;
+							break;
+						case 'n':  // load nonstring
+							arg1 = (char*) strdup(optarg);
+							PUSH(nonstring(arg1));
+							output = 1;
+							break;
+						case 'e':  // extract
+							arg1 = (char*) strdup(optarg);
+							json = PEEK;
+							PUSH(extract(maybe_deep(json), arg1));
+							output = 1;
+							break;
+						case 'd':  // delete
+							arg1 = (char*) strdup(optarg);
+							json = POP;
+							PUSH(delete(json, arg1));
+							output = 1;
+							break;
+						case 'i':  // insert
+							arg1 = (char*) strdup(optarg);
+							jval = POP;
+							json = POP;
+							PUSH(update_native(json, arg1, jval));
+							output = 1;
+							break;
+						case 'a':  // across
+							// something about -a is not mappable?
+							MAPPUSH();
+							MAPNEXT();
+							output = 0;
+							break;
+						case 'L':
+						case 'P':  // not manipulations
+						case 'S': 
+						case 'Q':
+						case 'V':
+						case 'C':
+						case 'I':
+						case 'F':
+							break;
+						default:
+							if (crash)
+								{exit(2);}
+							break;
+					}
+				}
+				if (!in_place && output && stackpointer != stack)
+					{printf("%s\n", smart_dumps(PEEK));}
+			} while (! MAPEMPTY);
+		}
 
-    if (in_place && strlen(file_path) > 0)
-    {
-        fp = fopen(file_path, "w");
-        fprintf(fp, "%s\n", smart_dumps(stack[0]));
-        fclose(fp);
-    }
+		if (in_place && strlen(file_path) > 0)
+		{
+			fp = fopen(file_path, "w");
+			fprintf(fp, "%s\n", smart_dumps(stack[0]));
+			fclose(fp);
+		}
+		free(json);
+	} while (bytes_read >= 0);
     return 0;
 }
-
-
